@@ -1,118 +1,137 @@
-multi_path - exploit for p0 issue 1558 (CVE-2018-4241)
+empty_list - exploit for p0 issue 1564 (CVE-2018-4243) iOS 11.0 - 11.3.1 kernel r/w
 @i41nbeer
 
-mptcp_usr_connectx is the handler for the connectx syscall for the AP_MULTIPATH socket family.
+BUG:
+getvolattrlist takes a user controlled bufferSize argument via the fgetattrlist syscall.
 
-The logic of this function fails to correctly handle source and destination sockaddrs which aren't
-AF_INET or AF_INET6:
+When allocating a kernel buffer to serialize the attr list to there's the following comment:
 
-//***************
-  // verify sa_len for AF_INET:
-
-  if (dst->sa_family == AF_INET &&
-      dst->sa_len != sizeof(mpte->__mpte_dst_v4)) {
-    mptcplog((LOG_ERR, "%s IPv4 dst len %u\n", __func__, dst->sa_len), MPTCP_SOCKET_DBG, MPTCP_LOGLVL_ERR);
-    error = EINVAL;
+/*
+* Allocate a target buffer for attribute results.
+* Note that since we won't ever copy out more than the caller requested,
+* we never need to allocate more than they offer.
+*/
+  ab.allocated = ulmin(bufferSize, fixedsize + varsize);
+  if (ab.allocated > ATTR_MAX_BUFFER) {
+    error = ENOMEM;
+   VFS_DEBUG(ctx, vp, "ATTRLIST - ERROR: buffer size too large (%d limit %d)", ab.allocated, ATTR_MAX_BUFFER);
     goto out;
   }
+  MALLOC(ab.base, char *, ab.allocated, M_TEMP, M_ZERO | M_WAITOK);
 
-  // verify sa_len for AF_INET6:
+The problem is that the code doesn't then correctly handle the case when the user supplied buffer size
+is smaller that the requested header size. If we pass ATTR_CMN_RETURNED_ATTRS we'll hit the following code:
 
-  if (dst->sa_family == AF_INET6 &&
-      dst->sa_len != sizeof(mpte->__mpte_dst_v6)) {
-    mptcplog((LOG_ERR, "%s IPv6 dst len %u\n", __func__, dst->sa_len), MPTCP_SOCKET_DBG, MPTCP_LOGLVL_ERR);
-    error = EINVAL;
-    goto out;
-  }
-
-  // code doesn't bail if sa_family was neither AF_INET nor AF_INET6
-
-  if (!(mpte->mpte_flags & MPTE_SVCTYPE_CHECKED)) {
-    if (mptcp_entitlement_check(mp_so) < 0) {
-      error = EPERM;
-      goto out;
+  /* Return attribute set output if requested. */
+  if (return_valid) {
+    ab.actual.commonattr |= ATTR_CMN_RETURNED_ATTRS;
+    if (pack_invalid) {
+      /* Only report the attributes that are valid */
+      ab.actual.commonattr &= ab.valid.commonattr;
+      ab.actual.volattr &= ab.valid.volattr;
     }
-
-    mpte->mpte_flags |= MPTE_SVCTYPE_CHECKED;
+    bcopy(&ab.actual, ab.base + sizeof(uint32_t), sizeof (ab.actual));
   }
 
-  // memcpy with sa_len up to 255:
+There's no check that the allocated buffer is big enough to hold at least that.
 
-  if ((mp_so->so_state & (SS_ISCONNECTED|SS_ISCONNECTING)) == 0) {
-    memcpy(&mpte->mpte_dst, dst, dst->sa_len);
-  }
+Exploitation:
+I hope to publish a longer-form write up of this, these are some rough notes on how the exploit works:
 
-//***************
+The bug gives you the ability to write 8 zero bytes off the end of a kalloc.16 allocation. Whilst it looks like you
+might be able to control a few bits in those bytes I'm not sure you actually can so I focused on exploiting
+as if it was writing a NULL pointer off the end.
 
-Looking around in the structure which you overflow inside you notice you can hit both fields here:
+This is pretty limited primitive so the first step is to try to enumerate possible things you could do:
+  * target a reference count, trying to turn the overflow into a UaF bug
+  * target a lock, trying to turn the overflow into a race condition bug
+  * target a pointer, trying to leak a reference count
+  * target a validated datastructure where 0 is an interesting value to change something to
 
-  if (mpte->mpte_itfinfo_size > MPTE_ITFINFO_SIZE)
-    _FREE(mpte->mpte_itfinfo, M_TEMP);
+In the end I chose the first option. There are then two further requirements:
+  * target needs a reference count in the first 8 bytes
+  * target has to be overflowable into from kalloc.16
 
-mpte_itfinfo_size is just before mpte_itfinfo.
+I chose to target struct ipc_port, which has a reference count field as its second dword thus fulfilling the
+first requirement. It is however not allocated in kalloc.16; instead it lives in its own zone (ipc_ports.)
 
-When the structure is initialized the mpte_itfinfo pointer points to a small inline array. If more subflows are added
-than will fit in there they are instead put in a heap buffer, and mpte_itfinfo will point to that.
+This means we have to aligned a kalloc.16 zone block just before an ipc_ports one, then overflow out of the
+last kalloc.16 allocation in the kalloc.16 block into the first on in ipc_ports.
 
-If you had another bug (eg the kernel heap disclosure bug from async_wake) you could overwrite the mpte_itfinfo field
-with any valid zone object and it would get free'd (in fact, you could also overwrite it with an offset into that object
-for even more fun!)
+There are two tricks we can use to make this easier:
+  1) freelist reversal
+  2) safely-overflowable allocations
 
-However, we don't have that.
+Freelist Reversal:
+zone allocations will come first from intermediate (partially full) pages. This means that if we just start free'ing and
+allocating k.16 objects somewhere in the middle of the groom they won't be re-used until
+the current intermediate page is either full or empty.
 
-Instead another approach is to partially overwrite the pointer. If we partially overwrite it with NULL bytes we can point
-it to a 256 byte, 65k, 16MB or 4GB aligned value.
+this provides a challenge because fresh page's freelist's are filled semi-randomly such that
+their allocations will go from the inside to the outside:
 
-In this exploit I choose a 3 byte NULL overwrite, which will cause a kfree of the mpte_itfinfo address rounded down to the
-next 16MB boundary.
+  | 9 8 6 5 2 1 3 4 7 10 | <-- example "randomized" allocation order from a fresh all-free page
 
-The exploitation flow is as follows:
+this means that our final intermediate k.16 and ports pages will look a bit like this:
 
-Allocate alternatingly 16MB of ipc_kmsgs followed by a bunch of mptcp sockets. The goal here is to get a kalloc.2048 allocation
-at that 16MB boundary.
+  | - - - 5 2 1 3 4 - - | - - - 4 1 2 3 5 - - |
+          kalloc.16             ipc_ports
 
-Use the bug to free one of the ipc_kmsgs, moving that page to the intermediate list and putting the 16MB-aligned allocation on a
-kalloc.2048 intermediate page freelist.
+if we use the overflow to corrupt a freelist entry we'll panic if it gets allocated, so we
+need to avoid that
 
-Allocate a bunch of filled 2047 byte pipes; the backing buffers for these pipes will come from kalloc.2048, hopefully including our
-16MB-aligned address.
+the trick is that by controlling the allocation and free order we can reverse the freelists such that
+the final intermediate pages will look more like this:
+  | 1 4 - - - - - 5 3 2 | 2 5 - - - - - 4 3 1 |
+        kalloc.16               ipc_ports
 
-Trigger the bug a second time, freeing the same address and this time then allocate a bunch of preallocated ipc_kmsg buffers from
-kalloc.2048.
+at this point we're much more likely to be able to free a kalloc.16 and realloc it for the overflow
+such that we can hit the first qword of an ipc_port.
 
-Now we hopefully have an ipc_kmsg (which we can get messages sent to and then receive) and a pipe buffer (which we can read and write)
-overlapping each other.
+Safely-Overflowable allocations:
+since there are likely to be many candidate allocations we're gonna have to overflow out of before we hit the
+target one (which is right at the end, just before the ipc_port) we need to make sure that the allocated objects
+on the kalloc.16 page are safe to corrupt with a NULL pointer.
 
-I use the thread exception port trick from extra_recipe to get messages sent to the prealloced ipc_kmsg buffer. Each time we check each
-of the pipes to see if any of them contain the message. When we find the right (ipc_kmsg,pipe) pair we can rewrite the message to send ourselves
-a fake port which lives inside the pipe buffer. I structure that fake port like the one from async_wake (which I based on yalu 10.2 by
-@qwertyoruiopz and @marcograss) to give me an early kernel read primitive.
+I use mach message ool_port descriptors for this, as NULL is a valid value.
 
-Using the kernel read primitive I find the kernel task and make a fake port which allows easier kernel memory read/write via
-mach_vm_read/mach_vm_write.
+Exploit Flow:
+We do the groom to reverse the kalloc.16 freelists and start trying to overflow into an ipc_port.
 
-Caveat: To connect mptcp sockets you do need the com.apple.developer.networking.multipath entitlement which requires an apple developer cert, which
-anyone can buy from Apple.
+We know the approximate range of mach port names which contain the to-be-corrupted port; after each overflow attempt
+we check each of these ports to see if the port was corrupted. A side-effect of successful corruption is that the
+port's io_active flag will be set to zero. We can detect this without causing side-effects using the
+mach_port_kobject MIG method.
+
+Once we find the corrupted port we need to cause a reference to be taken and dropped on it; and more importantly we
+need the code path which does this to not check the io_active flag. mach_port_set_attributes will do this for us.
+
+Now we've turned our NULL pointer write off the end of a kalloc.16 into a dangling mach port :)
+
+We cause a zone gc, aiming to get the port's memory reused as a kalloc.4096 page. We first get it reused as a ool_ports
+descriptor where the ip_context field overlaps with a send right we send ourselves to a canary port. This lets us
+learn the approximate address of our objects in the kernel. We then replace the ool_desc with a pipe buffer,
+and with a bit of fiddling are able to work out where the dangling mach port is in memory.
+
+We craft a fake kernel task port in there then clean up.
 
 Reliability:
-This is a security reseach tool and is faaaar from perfect. However, it should work most of the time, and when it does work it should
-do a good job of cleaning up so it won't panic later.
+The exploit does work, which was my goal :) Reliablilty is something like 30% maybe, it all hinges on how quickly you can do the initial overflow
+and test loop. If something else comes in and allocates or frees in kalloc.16 you increase the probability that you
+corrupt a freelist entry or something else and will panic.
 
-To improve the probability of it working:
-  * turn off wifi and go in to airplane mode
-  * reboot
-  * wait 30 seconds after restarting
-  * run the app from xcode
+I'm sure the exploit can be made more reliable; I've only got it to the point where I've demonstrated that this
+bug is exploitable. If you want to take this as a starting point and demonstrate how to improve reliability I'd love
+to read a blog post! I imagine this would involve actually monitoring kalloc.16 allocations and understanding what
+the failure cases are and how they can be prevented.
 
-Supported devices:
-It should work on iOS 11.0 - 11.3.1 inclusive. I have tested on: iPod Touch 6g, iPhone 6s, iPhone SE, iPhone 7, iPhone 8
+Success rates seem to be highest when the device has been rebooted and left idle for a bit.
 
-API:
-#include "sploit.h" and call go() to run the exploit.
-If it worked you can use the functions in kmem.h to read and write kernel memory
+Cleanup:
+If the exploit does work it should clean up after itself and not panic the device. The fake kernel task port will stay alive.
 
-Notes:
-Multiple people have publically bindiff'ed this bug from the patch (or their 0day got patched ;) read their stuff for more details:
-  @elvanderb gave a lightning talk about the bug at rump.beer in Paris on May 31st: https://www.rump.beer/2018/slides/ios_48h.pdf
-  @jaakerblom published a working exploit on github on June 1st: https://github.com/potmdehex/multipath_kfree
-     John's technique is similar to mine but he does a two-byte overflow rather than a three byte one, and replaces with different objects. good stuff!
+Use the functions in kmem.h to read and write kernel memory. Persist a send-right to tfp0 in there if you want to keep
+kernel memory access after this process exits.
+
+I've tested on: iPod Touch 6G, iPhone 6S, iPhone SE, iPhone 7, iPhone 8
+It should work on iOS 11 through iOS 11.3.1
