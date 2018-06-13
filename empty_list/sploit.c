@@ -411,7 +411,7 @@ mach_port_t run() {
     struct utsname u = { 0 };
     uname(&u);
     if (strstr(u.machine, "iPad5,") == u.machine) {
-        kernel_page_size = 0x1000; // this is 4k but host_page_size lies to us
+        kernel_page_size = 0x1000; // idk if this is required but I know for a fact iPad Air 2/Mini 4 does NOT use 16K pages. This caused yalu not to work properly before beta 7
     }
     
     if (kernel_page_size == 0x4000) {
