@@ -410,9 +410,9 @@ mach_port_t run() {
     
     struct utsname u = { 0 };
     uname(&u);
-    if (strstr(u.machine, "iPad5,") == u.machine) {
-        kernel_page_size = 0x1000; // idk if this is required but I know for a fact iPad Air 2/Mini 4 does NOT use 16K pages. This caused yalu not to work properly before beta 7
-    }
+    //if (strstr(u.machine, "iPad5,") == u.machine) {
+        kernel_page_size = getpagesize(); // lol, cuz why not? To me, this sorta felt like changing a certain galactic empire's currency value from 1 of itself to 0 of itself ~ @iDave1482
+    //}
     
     if (kernel_page_size == 0x4000) {
         printf("this device uses 16k kernel pages\n");
