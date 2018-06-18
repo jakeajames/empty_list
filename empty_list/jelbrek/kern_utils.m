@@ -33,22 +33,36 @@ void kfree(mach_vm_address_t address, vm_size_t size) {
 }
 
 uint64_t task_self_addr() {
+    
     uint64_t selfproc = proc_for_pid(getpid());
     if (selfproc == 0) {
         fprintf(stderr, "failed to find our task addr\n");
         exit(EXIT_FAILURE);
     }
     uint64_t addr = kread64(selfproc + offsetof_task);
-    return addr;
+    
+    uint64_t task_addr = addr;
+    uint64_t itk_space = kread64(task_addr + offsetof_itk_space);
+    
+    uint64_t is_table = kread64(itk_space + offsetof_ipc_space_is_table);
+    
+    uint32_t port_index = mach_task_self() >> 8;
+    const int sizeof_ipc_entry_t = 0x18;
+    
+    uint64_t port_addr = kread64(is_table + (port_index * sizeof_ipc_entry_t));
+    
+    return port_addr;
 }
 
 uint64_t ipc_space_kernel() {
-    return kread64(task_self_addr() + 060);
+    return kread64(task_self_addr() + 0x60);
 }
 
 uint64_t find_port_address(mach_port_name_t port) {
    
-    uint64_t task_addr = task_self_addr();
+    uint64_t task_port_addr = task_self_addr();
+    //uint64_t task_addr = task_self_addr();
+    uint64_t task_addr = kread64(task_port_addr + offsetof_ip_kobject);
     uint64_t itk_space = kread64(task_addr + offsetof_itk_space);
     
     uint64_t is_table = kread64(itk_space + offsetof_ipc_space_is_table);
@@ -244,7 +258,7 @@ void make_port_fake_task_port(mach_port_t port, uint64_t task_kaddr) {
 
 uint64_t proc_for_pid(pid_t pid) {
     uint64_t proc = kread64(find_allproc()), pd;
-    while (proc) {
+    while (proc) { //iterate over all processes till we find the one we're looking for
         pd = kread32(proc + offsetof_p_pid);
         if (pd == pid) return proc;
         proc = kread64(proc);
@@ -256,7 +270,7 @@ uint64_t proc_for_name(char *nm) {
     uint64_t proc = kread64(find_allproc());
     char name[40] = {0};
     while (proc) {
-        kread(proc + 0x268, name, 20);
+        kread(proc + 0x268, name, 20); //read 20 bytes off the process's name and compare
         if (strstr(name, nm)) return proc;
         proc = kread64(proc);
     }
@@ -276,6 +290,7 @@ unsigned int pid_for_name(char *nm) {
 }
 
 uint64_t find_kernproc() {
+    //since each process points to the next one and QiLin needs a pointer to kernproc find what's before it by doing kread64 twice I guess?
     uint64_t proc = kread64(find_allproc()), pd;
     while (proc) {
         pd = kread32(kread64(proc) + offsetof_p_pid);
@@ -319,6 +334,63 @@ uint64_t zm_fix_addr(uint64_t addr) {
     return zm_tmp < zm_hdr.start ? zm_tmp + 0x100000000 : zm_tmp;
 }
 
+int cp(const char *from, const char *to) {
+    int fd_to, fd_from;
+    char buf[4096];
+    ssize_t nread;
+    int saved_errno;
+    
+    fd_from = open(from, O_RDONLY);
+    if (fd_from < 0)
+        return -1;
+    
+    fd_to = open(to, O_WRONLY | O_CREAT | O_EXCL, 0666);
+    if (fd_to < 0)
+        goto out_error;
+    
+    while (nread = read(fd_from, buf, sizeof buf), nread > 0)
+    {
+        char *out_ptr = buf;
+        ssize_t nwritten;
+        
+        do {
+            nwritten = write(fd_to, out_ptr, nread);
+            
+            if (nwritten >= 0)
+            {
+                nread -= nwritten;
+                out_ptr += nwritten;
+            }
+            else if (errno != EINTR)
+            {
+                goto out_error;
+            }
+        } while (nread > 0);
+    }
+    
+    if (nread == 0)
+    {
+        if (close(fd_to) < 0)
+        {
+            fd_to = -1;
+            goto out_error;
+        }
+        close(fd_from);
+        
+        /* Success! */
+        return 0;
+    }
+    
+out_error:
+    saved_errno = errno;
+    
+    close(fd_from);
+    if (fd_to >= 0)
+        close(fd_to);
+    
+    errno = saved_errno;
+    return -1;
+}
 
 uint64_t getVnodeAtPath(const char *path) {
     extern uint64_t kslide;
@@ -336,10 +408,12 @@ uint64_t getVnodeAtPath(const char *path) {
     uint64_t ksym_vnode_lookup = 0xfffffff0071d6c84;
     uint64_t ksym_vfs_context_current = 0xfffffff0071f500c;
     
-    uint64_t context = zm_fix_addr(kexecute(ksym_vfs_context_current + kslide, 1, 0, 0, 0, 0, 0, 0)); //grab the vfs_context thanks iBSparkes aka PsychoTea
+    uint64_t context = zm_fix_addr(kexecute(ksym_vfs_context_current + kslide, 1, 0, 0, 0, 0, 0, 0)); //grab the vfs_context; thanks iBSparkes aka PsychoTea
     uint64_t vnode = kalloc(sizeof(unsigned int *)); //allocate memory on the kernel and grab the address
     
-    kexecute(ksym_vnode_lookup + kslide, path, 0, vnode, context, 0, 0, 0); //execute vnode_lookup()
+    kexecute(ksym_vnode_lookup + kslide, (uint64_t)path, 0, vnode, context, 0, 0, 0); //execute vnode_lookup()
     
     return kread64(vnode); //grab what vnode_lookup wrote in our vnode pointer
 }
+
+

